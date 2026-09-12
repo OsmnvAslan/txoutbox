@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
-from ..message import MessageId, OutboxMessage
+from ..message import MessageId, OutboxMessage, OutboxStats, Payload, encode_payload
 
 
 class Status(StrEnum):
@@ -30,11 +30,11 @@ class Record:
 
 
 class MemoryStorage:
-    """A dict-backed outbox. Rows are inserted with :meth:`add` (your "transaction").
+    """A dict-backed outbox for tests and demos. Rows are inserted with :meth:`add`.
 
-    With ``strict_ordering`` (default), a message whose key has an earlier message that
-    is pending but not claimable right now (leased elsewhere, or waiting for a retry)
-    is held back, so retries never reorder a key.
+    Strict ordering (default) holds back a message while an earlier pending message with
+    the same key is not claimable right now (leased elsewhere, or waiting for a retry).
+    Claims are atomic under a lock, so this is race-free.
     """
 
     def __init__(
@@ -48,10 +48,20 @@ class MemoryStorage:
 
     # -- producer side -----------------------------------------------------------------
 
-    def add(
+    async def add(
         self,
         topic: str,
-        payload: bytes,
+        payload: Payload,
+        *,
+        key: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> MessageId:
+        return self.add_sync(topic, payload, key=key, headers=headers)
+
+    def add_sync(
+        self,
+        topic: str,
+        payload: Payload,
         *,
         key: str | None = None,
         headers: Mapping[str, str] | None = None,
@@ -61,7 +71,7 @@ class MemoryStorage:
             OutboxMessage(
                 id=message_id,
                 topic=topic,
-                payload=payload,
+                payload=encode_payload(payload),
                 key=key,
                 headers=dict(headers or {}),
                 created_at=self._clock(),
@@ -79,6 +89,16 @@ class MemoryStorage:
 
     def __len__(self) -> int:
         return len(self._records)
+
+    async def stats(self) -> OutboxStats:
+        now = self._clock()
+        pending = self.records(Status.PENDING)
+        oldest = min((r.message.created_at for r in pending if r.message.created_at), default=None)
+        return OutboxStats(
+            pending=len(pending),
+            oldest_pending_age=None if oldest is None else now - oldest,
+            dead=len(self.records(Status.DEAD)),
+        )
 
     # -- Storage protocol --------------------------------------------------------------
 
@@ -108,26 +128,40 @@ class MemoryStorage:
                 claimed.append(_with_attempts(record.message, record.attempts))
             return claimed
 
-    async def ack(self, ids: Sequence[MessageId]) -> None:
+    async def ack(self, ids: Sequence[MessageId], *, worker_id: str) -> None:
         async with self._lock:
-            for message_id in ids:
-                record = self._records[message_id]
+            for record in self._owned(ids, worker_id):
                 record.status = Status.DONE
                 record.leased_by = record.lease_until = None
 
-    async def nack(self, message_id: MessageId, *, error: str, retry_at: datetime) -> None:
+    async def nack(
+        self, message_id: MessageId, *, worker_id: str, error: str, retry_at: datetime
+    ) -> None:
         async with self._lock:
-            record = self._records[message_id]
-            record.last_error = error
-            record.retry_at = retry_at
-            record.leased_by = record.lease_until = None
+            for record in self._owned([message_id], worker_id):
+                record.last_error = error
+                record.retry_at = retry_at
+                record.leased_by = record.lease_until = None
 
-    async def dead_letter(self, message_id: MessageId, *, error: str) -> None:
+    async def release(
+        self, ids: Sequence[MessageId], *, worker_id: str, retry_at: datetime
+    ) -> None:
         async with self._lock:
-            record = self._records[message_id]
-            record.status = Status.DEAD
-            record.last_error = error
-            record.leased_by = record.lease_until = None
+            for record in self._owned(ids, worker_id):
+                record.attempts -= 1
+                record.retry_at = retry_at
+                record.leased_by = record.lease_until = None
+
+    async def dead_letter(self, message_id: MessageId, *, worker_id: str, error: str) -> None:
+        async with self._lock:
+            for record in self._owned([message_id], worker_id):
+                record.status = Status.DEAD
+                record.last_error = error
+                record.leased_by = record.lease_until = None
+
+    def _owned(self, ids: Sequence[MessageId], worker_id: str) -> list[Record]:
+        """Fencing: only rows currently leased by this worker."""
+        return [r for i in ids if (r := self._records.get(i)) and r.leased_by == worker_id]
 
 
 def _with_attempts(message: OutboxMessage, attempts: int) -> OutboxMessage:

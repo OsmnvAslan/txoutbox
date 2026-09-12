@@ -21,6 +21,11 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
+      - name: Check that the tag matches the package version
+        if: github.event_name == 'push'
+        run: |
+          version=$(uv version --short)
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v$version"; exit 1; }
       - name: Build sdist and wheel
         run: uv build
       - name: Check metadata

@@ -18,7 +18,7 @@ def cfg(**kw) -> RelayConfig:
 async def test_publishes_everything_and_acks() -> None:
     storage, publisher = MemoryStorage(), MemoryPublisher()
     for i in range(7):
-        storage.add("orders", f"{i}".encode())
+        await storage.add("orders", f"{i}".encode())
     relay = Relay(storage, publisher, config=cfg(batch_size=3))
     results = [await relay.run_once() for _ in range(4)]
     assert [r.claimed for r in results] == [3, 3, 1, 0]
@@ -43,7 +43,7 @@ async def test_same_key_is_sequential_and_different_keys_overlap() -> None:
             active[m.key] -= 1
 
     for i in range(12):
-        storage.add("t", str(i).encode(), key=f"k{i % 3}")
+        await storage.add("t", str(i).encode(), key=f"k{i % 3}")
     result = await Relay(storage, Pub(), config=cfg(concurrency=10)).run_once()
     assert result.published == 12
     assert not overlap_within_key
@@ -63,7 +63,7 @@ async def test_concurrency_limit() -> None:
             active -= 1
 
     for _ in range(10):
-        storage.add("t", b"")
+        await storage.add("t", b"")
     await Relay(storage, Pub(), config=cfg(concurrency=2)).run_once()
     assert max_active == 2
 
@@ -77,7 +77,7 @@ async def test_failure_is_nacked_with_backoff_and_hook() -> None:
         async def on_retry(self, message, error, retry_at):
             seen.append((message, str(error), retry_at))
 
-    mid = storage.add("t", b"x")
+    mid = await storage.add("t", b"x")
     before = datetime.now(UTC)
     result = await Relay(storage, publisher, config=cfg(), hooks=H()).run_once()
     assert (result.retried, result.published) == (1, 0)
@@ -100,7 +100,7 @@ async def test_dead_letter_after_max_attempts() -> None:
         async def on_dead_letter(self, message, error):
             dead.append(message)
 
-    mid = storage.add("t", b"x")
+    mid = await storage.add("t", b"x")
     config = cfg(max_attempts=3, backoff=Backoff(base=timedelta(microseconds=1), jitter=0))
     relay = Relay(storage, publisher, config=config, hooks=H())
     outcomes = []
@@ -114,10 +114,10 @@ async def test_dead_letter_after_max_attempts() -> None:
     assert [m.id for m in dead] == [mid]
 
 
-async def test_failure_blocks_rest_of_key_group_but_not_other_keys() -> None:
+async def test_failure_releases_rest_of_key_group_without_burning_attempts() -> None:
     storage = MemoryStorage()
-    ids = [storage.add("t", str(i).encode(), key="k") for i in range(3)]
-    other = storage.add("t", b"o", key="other")
+    ids = [await storage.add("t", str(i).encode(), key="k") for i in range(3)]
+    other = await storage.add("t", b"o", key="other")
     publisher = MemoryPublisher(fail=lambda m: RuntimeError("x") if m.id == ids[0] else None)
     blocked: list[tuple] = []
 
@@ -131,13 +131,42 @@ async def test_failure_blocks_rest_of_key_group_but_not_other_keys() -> None:
     assert blocked == [(ids[1], ids[0]), (ids[2], ids[0])]
     for i in ids[1:]:
         rec = storage.get(i)
-        assert rec.last_error == f"blocked by {ids[0]!r}"
+        assert rec.attempts == 0, "released messages must not burn an attempt"
+        assert rec.last_error is None
         assert rec.retry_at == storage.get(ids[0]).retry_at
+        assert rec.leased_by is None
+
+
+async def test_followers_survive_a_poison_head() -> None:
+    """A head that dies after max_attempts must not drag its followers down with it."""
+    storage = MemoryStorage()
+    head = await storage.add("t", b"head", key="k")
+    f1 = await storage.add("t", b"f1", key="k")
+    f2 = await storage.add("t", b"f2", key="k")
+    failures = {head: 99, f1: 1}  # head always fails, f1 fails once
+
+    def fail(m: OutboxMessage) -> BaseException | None:
+        if failures.get(m.id, 0) > 0:
+            failures[m.id] -= 1
+            return RuntimeError("boom")
+        return None
+
+    publisher = MemoryPublisher(fail=fail)
+    config = cfg(max_attempts=3, backoff=Backoff(base=timedelta(microseconds=1), jitter=0))
+    relay = Relay(storage, publisher, config=config)
+    for _ in range(6):
+        await asyncio.sleep(0.001)
+        await relay.run_once()
+    assert storage.get(head).status is Status.DEAD
+    assert storage.get(f1).status is Status.DONE and storage.get(f1).attempts == 2
+    assert storage.get(f2).status is Status.DONE and storage.get(f2).attempts == 1
+    assert storage.get(f2).last_error is None
+    assert [m.payload for m in publisher.published] == [b"f1", b"f2"]
 
 
 async def test_publish_timeout_counts_as_failure() -> None:
     storage = MemoryStorage()
-    storage.add("t", b"x")
+    await storage.add("t", b"x")
     publisher = MemoryPublisher(delay=0.2)
     result = await Relay(storage, publisher, config=cfg(publish_timeout=0.01)).run_once()
     assert result.retried == 1
@@ -147,7 +176,7 @@ async def test_publish_timeout_counts_as_failure() -> None:
 async def test_run_loop_stops_gracefully_and_drains() -> None:
     storage, publisher = MemoryStorage(), MemoryPublisher(delay=0.01)
     for _ in range(5):
-        storage.add("t", b"x")
+        await storage.add("t", b"x")
     relay = Relay(storage, publisher, config=cfg(batch_size=2))
     task = asyncio.create_task(relay.run())
     while len(publisher.published) < 5:
@@ -161,7 +190,7 @@ async def test_context_manager_and_wake() -> None:
     storage, publisher = MemoryStorage(), MemoryPublisher()
     async with Relay(storage, publisher, config=cfg(poll_min=5, poll_max=5)) as relay:
         await asyncio.sleep(0.02)  # relay is now asleep for 5s
-        storage.add("t", b"x")
+        await storage.add("t", b"x")
         relay.wake()
         deadline = time.monotonic() + 1
         while not publisher.published and time.monotonic() < deadline:
@@ -181,7 +210,7 @@ async def test_storage_errors_do_not_kill_the_loop() -> None:
             return await super().claim(**kw)
 
     storage, publisher = Flaky(), MemoryPublisher()
-    storage.add("t", b"x")
+    await storage.add("t", b"x")
     relay = Relay(storage, publisher, config=cfg(storage_error_delay=0.01))
     task = asyncio.create_task(relay.run())
     deadline = time.monotonic() + 1
@@ -198,8 +227,8 @@ async def test_bookkeeping_errors_do_not_kill_the_round() -> None:
             raise ConnectionError("db gone")
 
     storage = Broken()
-    storage.add("t", b"a")
-    storage.add("t", b"b")
+    await storage.add("t", b"a")
+    await storage.add("t", b"b")
     publisher = MemoryPublisher(fail=lambda m: RuntimeError() if m.payload == b"a" else None)
     result = await Relay(storage, publisher, config=cfg()).run_once()
     assert (result.published, result.retried) == (1, 1)
@@ -211,7 +240,7 @@ async def test_hook_exceptions_are_swallowed() -> None:
             raise RuntimeError("telemetry down")
 
     storage, publisher = MemoryStorage(), MemoryPublisher()
-    storage.add("t", b"x")
+    await storage.add("t", b"x")
     result = await Relay(storage, publisher, config=cfg(), hooks=Bad()).run_once()
     assert result.published == 1
 
@@ -227,7 +256,7 @@ async def test_signal_handler_stops_run() -> None:
 
 async def test_cancellation_propagates() -> None:
     storage = MemoryStorage()
-    storage.add("t", b"x")
+    await storage.add("t", b"x")
     relay = Relay(storage, MemoryPublisher(delay=10), config=cfg())
     task = asyncio.create_task(relay.run())
     await asyncio.sleep(0.02)
@@ -238,6 +267,8 @@ async def test_cancellation_propagates() -> None:
 
 def test_config_validation() -> None:
     for bad in (
+        dict(publish_timeout=0),
+        dict(storage_error_delay=-1),
         dict(batch_size=0),
         dict(concurrency=0),
         dict(max_attempts=0),
@@ -250,3 +281,87 @@ def test_config_validation() -> None:
 def test_worker_id_is_unique() -> None:
     a, b = Relay(MemoryStorage(), MemoryPublisher()), Relay(MemoryStorage(), MemoryPublisher())
     assert a.worker_id != b.worker_id
+
+
+async def test_publisher_can_be_a_plain_function() -> None:
+    storage = MemoryStorage()
+    await storage.add("t", {"n": 1})
+    seen: list[OutboxMessage] = []
+
+    async def publish(message: OutboxMessage) -> None:
+        seen.append(message)
+
+    result = await Relay(storage, publish, config=cfg()).run_once()
+    assert result.published == 1 and seen[0].json() == {"n": 1}
+
+
+async def test_poller_resets_after_full_batches() -> None:
+    storage, publisher = MemoryStorage(), MemoryPublisher()
+    relay = Relay(storage, publisher, config=cfg(batch_size=2, poll_min=0.01, poll_max=1.0))
+    poller = relay._poller
+    for _ in range(8):
+        poller.idle()
+    assert poller.current == 1.0
+    for _ in range(4):
+        await storage.add("t", b"x")  # exactly two full batches
+    task = asyncio.create_task(relay.run())
+    while len(publisher.published) < 4:
+        await asyncio.sleep(0.005)
+    relay.stop()
+    await task
+    assert poller.current < 0.1, "burst of full batches must not leave the poller at maximum"
+
+
+async def test_cancellation_still_acks_what_was_published() -> None:
+    storage = MemoryStorage()
+    fast = await storage.add("t", b"fast")
+    slow = await storage.add("t", b"slow")
+
+    class Pub:
+        async def publish(self, m: OutboxMessage) -> None:
+            if m.id == slow:
+                await asyncio.sleep(10)
+
+    relay = Relay(storage, Pub(), config=cfg(publish_timeout=None))
+    task = asyncio.create_task(relay.run_once())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert storage.get(fast).status is Status.DONE
+    assert storage.get(slow).status is Status.PENDING
+
+
+async def test_on_round_hook_and_failure_summary(caplog: pytest.LogCaptureFixture) -> None:
+    storage = MemoryStorage()
+    await storage.add("t", b"x")
+    rounds: list[tuple[int, float]] = []
+
+    class H(Hooks):
+        async def on_round(self, result, duration):
+            rounds.append((result.claimed, duration))
+
+    publisher = MemoryPublisher(fail=lambda m: RuntimeError("down"))
+    import logging
+
+    logging.getLogger("txoutbox").setLevel(logging.WARNING)
+    with caplog.at_level(logging.WARNING, logger="txoutbox"):
+        await Relay(storage, publisher, config=cfg(), hooks=H()).run_once()
+    assert rounds and rounds[0][0] == 1
+    assert sum("round:" in r.message for r in caplog.records) == 1
+    logging.getLogger("txoutbox").setLevel(logging.CRITICAL)
+
+
+async def test_second_signal_cancels_the_round() -> None:
+    storage = MemoryStorage()
+    await storage.add("t", b"x")
+    relay = Relay(storage, MemoryPublisher(delay=10), config=cfg(publish_timeout=None))
+    task = asyncio.create_task(relay.run(handle_signals=True))
+    await asyncio.sleep(0.05)
+    signal.raise_signal(signal.SIGTERM)
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    signal.raise_signal(signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL

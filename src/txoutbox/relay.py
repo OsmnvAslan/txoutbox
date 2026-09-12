@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import socket
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from typing import Self
 from .backoff import Backoff
 from .message import MessageId, OutboxMessage
 from .poller import AdaptivePoller
-from .protocols import Hooks, Publisher, Storage
+from .protocols import Hooks, Publisher, PublishFn, Storage
 
 log = logging.getLogger("txoutbox")
 
@@ -33,8 +34,9 @@ class RelayConfig:
     #: A message that fails on its ``max_attempts``-th claim is dead-lettered.
     max_attempts: int = 10
     backoff: Backoff = field(default_factory=Backoff)
-    #: Per-message publish timeout in seconds. ``None`` disables it.
-    publish_timeout: float | None = None
+    #: Per-message publish timeout in seconds, so a hanging broker cannot outlive the
+    #: lease. ``None`` disables it.
+    publish_timeout: float | None = 10.0
     #: Idle polling: sleep grows from ``poll_min`` to ``poll_max`` while the table is empty.
     poll_min: float = 0.05
     poll_max: float = 5.0
@@ -51,6 +53,10 @@ class RelayConfig:
             raise ValueError("max_attempts must be >= 1")
         if self.lease <= timedelta(0):
             raise ValueError("lease must be positive")
+        if self.publish_timeout is not None and self.publish_timeout <= 0:
+            raise ValueError("publish_timeout must be positive or None")
+        if self.storage_error_delay < 0:
+            raise ValueError("storage_error_delay must be >= 0")
 
 
 @dataclass(slots=True)
@@ -72,8 +78,20 @@ def default_worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 
+class _FnPublisher:
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn: PublishFn) -> None:
+        self._fn = fn
+
+    async def publish(self, message: OutboxMessage) -> None:
+        await self._fn(message)
+
+
 class Relay:
     """Moves messages from a :class:`Storage` to a :class:`Publisher`.
+
+    ``publisher`` is any object with ``async def publish(message)``, or such a function.
 
     Use it as a long-running loop (:meth:`run`), as a background task
     (``async with Relay(...)``), or one round at a time (:meth:`run_once`),
@@ -83,14 +101,16 @@ class Relay:
     def __init__(
         self,
         storage: Storage,
-        publisher: Publisher,
+        publisher: Publisher | PublishFn,
         *,
         config: RelayConfig | None = None,
         hooks: Hooks | None = None,
         worker_id: str | None = None,
     ) -> None:
         self.storage = storage
-        self.publisher = publisher
+        self.publisher: Publisher = (
+            publisher if isinstance(publisher, Publisher) else _FnPublisher(publisher)
+        )
         self.config = config or RelayConfig()
         self.hooks = hooks or Hooks()
         self.worker_id = worker_id or default_worker_id()
@@ -105,7 +125,10 @@ class Relay:
     # -- lifecycle ---------------------------------------------------------------------
 
     def wake(self) -> None:
-        """Cut the idle sleep short. Call it after inserting rows, or from LISTEN/NOTIFY."""
+        """Cut the idle sleep short. Call it after inserting rows, or from LISTEN/NOTIFY.
+
+        Not thread-safe: from another thread use ``loop.call_soon_threadsafe(relay.wake)``.
+        """
         self._poller.wake()
 
     def stop(self) -> None:
@@ -116,17 +139,31 @@ class Relay:
     async def run(self, *, handle_signals: bool = False) -> None:
         """Loop until :meth:`stop` is called.
 
-        With ``handle_signals=True``, SIGINT and SIGTERM call :meth:`stop`, so the
-        round in flight finishes and leases are released cleanly.
+        With ``handle_signals=True``, the first SIGINT/SIGTERM calls :meth:`stop`, so the
+        round in flight finishes and leases are released cleanly. A second signal cancels
+        the round outright. Previous handlers are restored on exit.
         """
         self._stopping = False
         loop = asyncio.get_running_loop()
-        installed: list[signal.Signals] = []
+        task = asyncio.current_task()
+        previous: dict[signal.Signals, object] = {}
+        signals_seen = 0
+
+        def on_signal() -> None:
+            nonlocal signals_seen
+            signals_seen += 1
+            if signals_seen == 1:
+                log.info("signal received; finishing the current round")
+                self.stop()
+            elif task is not None:
+                log.warning("second signal; cancelling the current round")
+                task.cancel()
+
         if handle_signals:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 try:
-                    loop.add_signal_handler(sig, self.stop)
-                    installed.append(sig)
+                    previous[sig] = signal.getsignal(sig)
+                    loop.add_signal_handler(sig, on_signal)
                 except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows
                     log.warning("cannot install handler for %s", sig.name)
         try:
@@ -137,22 +174,24 @@ class Relay:
                     raise
                 except Exception:
                     delay = self.config.storage_error_delay
-                    log.exception("storage error; retrying in %.1fs", delay)
+                    log.exception("round failed; retrying in %.1fs", delay)
                     await asyncio.sleep(delay)
                     continue
                 if self._stopping:
                     break
-                if result.claimed >= self.config.batch_size:
-                    await asyncio.sleep(0)  # full batch: there is probably more, don't sleep
-                    continue
                 if result.claimed:
                     self._poller.busy()
+                    if result.claimed >= self.config.batch_size:
+                        await asyncio.sleep(0)  # full batch: there is probably more
+                        continue
                 else:
                     self._poller.idle()
                 await self._poller.wait()
         finally:
-            for sig in installed:
+            for sig, handler in previous.items():
                 loop.remove_signal_handler(sig)
+                if callable(handler) or handler in (signal.SIG_DFL, signal.SIG_IGN):
+                    signal.signal(sig, handler)  # type: ignore[arg-type]
 
     async def __aenter__(self) -> Self:
         self._task = asyncio.create_task(self.run(), name=f"txoutbox-relay-{self.worker_id}")
@@ -172,8 +211,12 @@ class Relay:
     # -- one round ---------------------------------------------------------------------
 
     async def run_once(self) -> RoundResult:
-        """Claim one batch, publish it, report back to storage. Storage errors propagate."""
+        """Claim one batch, publish it, report back to storage. Storage errors propagate.
+
+        Messages the publisher accepted are acked even if the round is cancelled.
+        """
         cfg = self.config
+        started = time.monotonic()
         messages = await self.storage.claim(
             batch_size=cfg.batch_size, lease=cfg.lease, worker_id=self.worker_id
         )
@@ -189,12 +232,31 @@ class Relay:
             async with semaphore:
                 await self._publish_group(group, acked, result)
 
-        async with asyncio.TaskGroup() as tg:
-            for group in _group_by_key(messages):
-                tg.create_task(run_group(group))
-
-        if acked:
-            await self.storage.ack(acked)
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for group in _group_by_key(messages):
+                    tg.create_task(run_group(group))
+        finally:
+            if acked:
+                await asyncio.shield(self.storage.ack(acked, worker_id=self.worker_id))
+            duration = time.monotonic() - started
+            if duration > cfg.lease.total_seconds():
+                log.warning(
+                    "round took %.1fs, longer than the %.0fs lease; other workers may have "
+                    "re-claimed messages. Lower batch_size or raise lease/concurrency.",
+                    duration,
+                    cfg.lease.total_seconds(),
+                )
+            if result.failed:
+                log.warning(
+                    "round: %d claimed, %d published, %d retried, %d dead-lettered, %d blocked",
+                    result.claimed,
+                    result.published,
+                    result.retried,
+                    result.dead_lettered,
+                    result.blocked,
+                )
+            await self._hook(self.hooks.on_round, result, duration)
         return result
 
     async def _publish_group(
@@ -228,13 +290,17 @@ class Relay:
         now = datetime.now(UTC)
         if message.attempts >= self.config.max_attempts:
             log.error("dead-lettering %r after %d attempts: %s", message.id, message.attempts, text)
-            await self._report(self.storage.dead_letter(message.id, error=text))
+            await self._report(
+                self.storage.dead_letter(message.id, worker_id=self.worker_id, error=text)
+            )
             result.dead_lettered += 1
             await self._hook(self.hooks.on_dead_letter, message, error)
             return now
         retry_at = now + self.config.backoff.delay(message.attempts)
-        log.warning("publish failed for %r (attempt %d): %s", message.id, message.attempts, text)
-        await self._report(self.storage.nack(message.id, error=text, retry_at=retry_at))
+        log.debug("publish failed for %r (attempt %d): %s", message.id, message.attempts, text)
+        await self._report(
+            self.storage.nack(message.id, worker_id=self.worker_id, error=text, retry_at=retry_at)
+        )
         result.retried += 1
         await self._hook(self.hooks.on_retry, message, error, retry_at)
         return retry_at
@@ -246,11 +312,17 @@ class Relay:
         retry_at: datetime,
         result: RoundResult,
     ) -> None:
-        """Later messages with the same key must not overtake the failed one."""
-        text = f"blocked by {failed.id!r}"
+        """Later messages with the same key must not overtake the failed one.
+
+        They were never tried, so they are released without burning an attempt.
+        """
+        if not rest:
+            return
+        await self._report(
+            self.storage.release([m.id for m in rest], worker_id=self.worker_id, retry_at=retry_at)
+        )
+        result.blocked += len(rest)
         for message in rest:
-            await self._report(self.storage.nack(message.id, error=text, retry_at=retry_at))
-            result.blocked += 1
             await self._hook(self.hooks.on_blocked, message, failed)
 
     # -- helpers -----------------------------------------------------------------------
