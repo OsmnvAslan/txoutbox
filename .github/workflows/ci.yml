@@ -38,7 +38,7 @@ jobs:
       - name: Install
         run: uv sync --group dev --group examples --extra postgres
       - name: Test
-        run: uv run pytest -q
+        run: uv run pytest -q --timeout=120
 
   lint:
     name: lint

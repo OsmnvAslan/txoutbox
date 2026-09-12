@@ -289,6 +289,88 @@ async def test_notify_and_listen(pool) -> None:
     await _drop(pool, storage)
 
 
+async def test_listen_defers_wake_by_visibility_delay(pool) -> None:
+    channel = f"ch_{uuid.uuid4().hex[:8]}"
+    storage = await _make(
+        pool, notify_channel=channel, visibility_delay=timedelta(milliseconds=300)
+    )
+    fired: list[float] = []
+    loop = asyncio.get_running_loop()
+    listener = await storage.listen(lambda: fired.append(loop.time()))
+    try:
+        inserted = loop.time()
+        await storage.add("t", b"p")
+        await storage.add("t", b"q")  # second NOTIFY while the timer is pending: no extra wake
+        await asyncio.sleep(0.1)
+        assert fired == [], "callback must wait for the row to become visible"
+        await asyncio.sleep(0.5)
+        assert len(fired) == 1
+        assert fired[0] - inserted >= 0.3
+        # the deferred wake lands on a claimable row
+        got = await storage.claim(batch_size=10, lease=LEASE, worker_id="w")
+        assert len(got) == 2
+    finally:
+        await listener.close()
+    await _drop(pool, storage)
+
+
+async def test_listener_reconnects_after_backend_termination(pool) -> None:
+    channel = f"ch_{uuid.uuid4().hex[:8]}"
+    storage = await _make(pool, notify_channel=channel)
+    hits = 0
+
+    def bump() -> None:
+        nonlocal hits
+        hits += 1
+
+    listener = await storage.listen(bump)
+    try:
+        assert listener.connection is not None
+        pid = listener.connection.get_server_pid()
+        assert await pool.fetchval("SELECT pg_terminate_backend($1)", pid) is True
+        # wait for the listener to notice and come back on a fresh connection
+        async with asyncio.timeout(3):
+            while listener.connection is None or listener.connection.get_server_pid() == pid:
+                await asyncio.sleep(0.05)
+        await storage.add("t", b"after")
+        async with asyncio.timeout(3):
+            while hits == 0:
+                await asyncio.sleep(0.05)
+        assert hits == 1
+    finally:
+        await listener.close()
+    assert await pool.fetchval("SELECT 1") == 1
+    await _drop(pool, storage)
+
+
+async def test_listener_stops_reconnecting_when_closed_during_gap(pool) -> None:
+    channel = f"ch_{uuid.uuid4().hex[:8]}"
+    storage = await _make(pool, notify_channel=channel)
+    listener = await storage.listen(lambda: None)
+    assert listener.connection is not None
+    pid = listener.connection.get_server_pid()
+    await pool.fetchval("SELECT pg_terminate_backend($1)", pid)
+    await asyncio.sleep(0.05)
+    await listener.close()  # must not hang or raise while a reconnect is in flight
+    assert listener.connection is None
+    assert await pool.fetchval("SELECT 1") == 1
+    await _drop(pool, storage)
+
+
+async def test_stats_uses_two_index_friendly_queries(pool) -> None:
+    storage = await _make(pool)
+    assert "FILTER" not in storage._sql.stats_pending
+    assert "WHERE status = 'pending'" in storage._sql.stats_pending
+    assert "WHERE status = 'dead'" in storage._sql.stats_dead
+    await storage.add("t", b"a")
+    (m,) = await storage.claim(batch_size=1, lease=LEASE, worker_id="w")
+    await storage.dead_letter(m.id, worker_id="w", error="x")
+    await storage.add("t", b"b")
+    s = await storage.stats()
+    assert (s.pending, s.dead) == (1, 1) and s.oldest_pending_age is not None
+    await _drop(pool, storage)
+
+
 async def test_listen_requires_channel(pool) -> None:
     storage = PostgresStorage(pool)
     with pytest.raises(ValueError):

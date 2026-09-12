@@ -6,13 +6,18 @@ table without stepping on each other. Install with ``pip install txoutbox[postgr
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Any, Self
 
 from ..message import MessageId, OutboxMessage, OutboxStats, Payload, encode_payload
+
+log = logging.getLogger("txoutbox.postgres")
 
 try:
     import asyncpg
@@ -61,9 +66,12 @@ class PostgresStorage:
     * ``strict_ordering`` (default) holds back a message while an earlier pending message
       with the same key is not claimable (leased elsewhere, or waiting for its retry).
       To make that predicate correct across concurrent workers, each claim takes a
-      transaction-scoped advisory lock on the table, so claims are serialised. A claim is
-      a single statement that takes milliseconds; publishing, the slow part, still runs
-      in parallel on every worker.
+      transaction-scoped advisory lock on the table, so claims are serialised. Order of
+      magnitude: one claim at a time per table, each a single statement of a few
+      milliseconds, so throughput tops out at roughly ``1000 / claim_ms * batch_size``
+      messages per second (thousands per second with ``batch_size=100``) no matter how
+      many workers you add. Publishing, the slow part, still runs in parallel on every
+      worker. If you do not use keys, ``strict_ordering=False`` removes the lock.
     * ``delete_on_ack`` removes delivered rows instead of marking them ``done``.
     * ``visibility_delay`` claims only rows older than the given age. ``BIGSERIAL`` ids
       are assigned at insert time, not commit time, so a long transaction can commit a
@@ -213,13 +221,21 @@ class PostgresStorage:
     # -- operations --------------------------------------------------------------------
 
     async def stats(self) -> OutboxStats:
-        row = await self.pool.fetchrow(self._sql.stats)
+        """Queue depth and lag. Two queries, each served by a partial index."""
+        async with self.pool.acquire() as conn:
+            pending = await conn.fetchrow(self._sql.stats_pending)
+            dead: int = await conn.fetchval(self._sql.stats_dead)
         return OutboxStats(
-            pending=row["pending"], oldest_pending_age=row["oldest"], dead=row["dead"]
+            pending=pending["pending"], oldest_pending_age=pending["oldest"], dead=dead
         )
 
     async def purge(self, older_than: timedelta) -> int:
-        """Delete ``done`` rows older than ``older_than``. Returns the number deleted."""
+        """Delete ``done`` rows older than ``older_than``. Returns the number deleted.
+
+        Age is measured from ``created_at``; there is no ``acked_at`` column. A row that
+        retried for a week and was delivered today is purged as soon as it is older than
+        ``older_than``, so pick a window comfortably longer than your longest retry.
+        """
         if self.delete_on_ack:
             return 0
         status: str = await self.pool.execute(self._sql.purge, older_than)
@@ -228,7 +244,12 @@ class PostgresStorage:
     async def listen(self, callback: Callable[[], None]) -> Listener:
         """Call ``callback()`` on every ``NOTIFY`` on ``notify_channel``.
 
-        Holds one pooled connection until :meth:`Listener.close`. Typical use::
+        Holds one pooled connection until :meth:`Listener.close`. If that connection
+        drops, the listener logs a warning and reconnects with backoff; meanwhile the
+        relay simply falls back to polling (``poll_max``, 5 s by default), so nothing
+        is lost. With ``visibility_delay`` set, the callback is deferred by that delay,
+        because the row that triggered the notification is not claimable yet.
+        Typical use::
 
             listener = await storage.listen(relay.wake)
             ...
@@ -236,26 +257,61 @@ class PostgresStorage:
         """
         if not self.notify_channel:
             raise ValueError("listen() needs notify_channel")
-        conn = await self.pool.acquire()
-        try:
-            await conn.add_listener(self.notify_channel, lambda *_: callback())
-        except BaseException:
-            await self.pool.release(conn)
-            raise
-        return Listener(self.pool, conn, self.notify_channel)
+        listener = Listener(self.pool, self.notify_channel, callback, delay=self.visibility_delay)
+        await listener.start()
+        return listener
 
 
 class Listener:
-    """Handle returned by :meth:`PostgresStorage.listen`. Also an async context manager."""
+    """Handle returned by :meth:`PostgresStorage.listen`. Also an async context manager.
 
-    def __init__(self, pool: asyncpg.Pool, conn: asyncpg.Connection, channel: str) -> None:
+    Reconnects automatically when the listening connection is terminated, until
+    :meth:`close` is called or the pool is closing.
+    """
+
+    #: Reconnect backoff, seconds: starts here and doubles up to ``MAX_BACKOFF``.
+    INITIAL_BACKOFF = 0.5
+    MAX_BACKOFF = 10.0
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        channel: str,
+        callback: Callable[[], None],
+        *,
+        delay: timedelta | None = None,
+    ) -> None:
         self._pool = pool
-        self._conn: asyncpg.Connection | None = conn
         self._channel = channel
+        self._callback = callback
+        self._delay = None if delay is None else delay.total_seconds() + 0.05
+        self._conn: asyncpg.Connection | None = None
+        self._closed = False
+        self._timer: asyncio.TimerHandle | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def connection(self) -> asyncpg.Connection | None:
+        """The listening connection, or ``None`` while reconnecting."""
+        return self._conn
+
+    async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        await self._connect()
 
     async def close(self) -> None:
+        self._closed = True
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if self._reconnect_task is not None:
+            self._reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reconnect_task
+            self._reconnect_task = None
         conn, self._conn = self._conn, None
-        if conn is None:
+        if conn is None or conn.is_closed():
             return
         try:
             await conn.reset()  # drops listeners
@@ -272,6 +328,66 @@ class Listener:
         tb: TracebackType | None,
     ) -> None:
         await self.close()
+
+    # -- internals ---------------------------------------------------------------------
+
+    async def _connect(self) -> None:
+        conn = await self._pool.acquire()
+        try:
+            await conn.add_listener(self._channel, self._on_notify)
+            conn.add_termination_listener(self._on_terminated)
+        except BaseException:
+            await self._pool.release(conn)
+            raise
+        self._conn = conn
+
+    def _on_notify(self, *_: object) -> None:
+        if self._closed:
+            return
+        if self._delay is None:
+            self._callback()
+            return
+        if self._timer is None and self._loop is not None:
+            self._timer = self._loop.call_later(self._delay, self._fire)
+
+    def _fire(self) -> None:
+        self._timer = None
+        if not self._closed:
+            self._callback()
+
+    def _on_terminated(self, _conn: object) -> None:
+        # asyncpg already returned the dead connection's slot to the pool.
+        if self._closed or self._loop is None:
+            return
+        self._conn = None
+        if self._pool.is_closing():
+            log.warning("listener on %r lost its connection; pool is closing", self._channel)
+            return
+        log.warning(
+            "listener on %r lost its connection; reconnecting (relay falls back to polling)",
+            self._channel,
+        )
+        self._reconnect_task = self._loop.create_task(self._reconnect())
+
+    async def _reconnect(self) -> None:
+        backoff = self.INITIAL_BACKOFF
+        while not self._closed and not self._pool.is_closing():
+            try:
+                await self._connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "listener on %r could not reconnect (%s); retrying in %.1fs",
+                    self._channel,
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self.MAX_BACKOFF)
+                continue
+            log.info("listener on %r reconnected", self._channel)
+            return
 
 
 _INIT_KWARGS = frozenset(
@@ -323,11 +439,11 @@ class _Sql:
             f"UPDATE {table} SET status = 'dead', last_error = $1, leased_by = NULL,"
             " lease_until = NULL WHERE id = $2 AND leased_by = $3"
         )
-        self.stats = (
-            "SELECT count(*) FILTER (WHERE status = 'pending') AS pending,"
-            " now() - min(created_at) FILTER (WHERE status = 'pending') AS oldest,"
-            f" count(*) FILTER (WHERE status = 'dead') AS dead FROM {table}"
+        self.stats_pending = (
+            "SELECT count(*) AS pending, now() - min(created_at) AS oldest"
+            f" FROM {table} WHERE status = 'pending'"
         )
+        self.stats_dead = f"SELECT count(*) FROM {table} WHERE status = 'dead'"
         self.purge = (
             f"DELETE FROM {table} WHERE status = 'done' AND created_at < now() - $1::interval"
         )

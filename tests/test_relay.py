@@ -352,7 +352,7 @@ async def test_on_round_hook_and_failure_summary(caplog: pytest.LogCaptureFixtur
     logging.getLogger("txoutbox").setLevel(logging.CRITICAL)
 
 
-async def test_second_signal_cancels_the_round() -> None:
+async def test_second_signal_cancels_the_round_and_returns_quietly() -> None:
     storage = MemoryStorage()
     await storage.add("t", b"x")
     relay = Relay(storage, MemoryPublisher(delay=10), config=cfg(publish_timeout=None))
@@ -362,6 +362,76 @@ async def test_second_signal_cancels_the_round() -> None:
     await asyncio.sleep(0.05)
     assert not task.done()
     signal.raise_signal(signal.SIGTERM)
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 1)
+    await asyncio.wait_for(task, 1)  # no CancelledError leaks out
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+async def test_plain_signal_handler_is_restored() -> None:
+    hits: list[int] = []
+    previous = signal.signal(signal.SIGTERM, lambda signum, frame: hits.append(signum))
+    try:
+        relay = Relay(MemoryStorage(), MemoryPublisher(), config=cfg())
+        task = asyncio.create_task(relay.run(handle_signals=True))
+        await asyncio.sleep(0.02)
+        signal.raise_signal(signal.SIGTERM)
+        await asyncio.wait_for(task, 1)
+        assert hits == []  # the relay handled it
+        signal.raise_signal(signal.SIGTERM)
+        assert hits == [signal.SIGTERM]  # ours is back
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+async def test_loop_signal_handler_is_not_clobbered_into_a_noop() -> None:
+    """We cannot restore a loop-level handler, but we must not leave asyncio's C stub behind."""
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, lambda: None)
+    try:
+        relay = Relay(MemoryStorage(), MemoryPublisher(), config=cfg())
+        task = asyncio.create_task(relay.run(handle_signals=True))
+        await asyncio.sleep(0.02)
+        signal.raise_signal(signal.SIGTERM)
+        await asyncio.wait_for(task, 1)
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+def test_config_warns_when_worst_case_round_exceeds_lease(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    logging.getLogger("txoutbox").setLevel(logging.WARNING)
+    try:
+        with caplog.at_level(logging.WARNING, logger="txoutbox"):
+            RelayConfig()  # defaults are consistent
+            assert not caplog.records
+            bad = RelayConfig(
+                batch_size=100, concurrency=10, publish_timeout=10, lease=timedelta(seconds=30)
+            )
+            assert bad.worst_case_round == 100
+            assert any("worst-case round" in r.message for r in caplog.records)
+    finally:
+        logging.getLogger("txoutbox").setLevel(logging.CRITICAL)
+    assert RelayConfig(publish_timeout=None).worst_case_round is None
+
+
+async def test_first_failure_is_logged_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    storage = MemoryStorage()
+    await storage.add("t", b"x")
+    publisher = MemoryPublisher(fail=lambda m: RuntimeError("broker down"))
+    relay = Relay(
+        storage, publisher, config=cfg(backoff=Backoff(base=timedelta(microseconds=1), jitter=0))
+    )
+    logging.getLogger("txoutbox").setLevel(logging.DEBUG)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="txoutbox"):
+            await relay.run_once()
+            await asyncio.sleep(0.001)
+            await relay.run_once()
+    finally:
+        logging.getLogger("txoutbox").setLevel(logging.CRITICAL)
+    levels = [r.levelno for r in caplog.records if "broker down" in r.message]
+    assert levels == [logging.INFO, logging.DEBUG]

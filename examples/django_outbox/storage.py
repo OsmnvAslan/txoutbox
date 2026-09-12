@@ -17,7 +17,6 @@ Relay side, e.g. in a management command::
 Strict per-key ordering is implemented the same way as ``txoutbox.adapters.postgres``:
 a ``NOT EXISTS`` predicate plus a transaction-scoped advisory lock, so two relay
 processes never split one key. ``select_for_update(skip_locked=True)`` needs
-PostgreSQL or MySQL 8. All methods run in Django's sync thread via ``sync_to_async``.
 """
 
 from __future__ import annotations

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import signal
 import socket
@@ -26,17 +27,18 @@ log = logging.getLogger("txoutbox")
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RelayConfig:
     #: Max messages claimed per round.
-    batch_size: int = 100
-    #: How long a claim is held. Must comfortably exceed the time to publish one round.
-    lease: timedelta = timedelta(seconds=30)
+    batch_size: int = 50
+    #: How long a claim is held. Must exceed the worst-case round:
+    #: ``ceil(batch_size / concurrency) * publish_timeout``. With the defaults that is 25 s.
+    lease: timedelta = timedelta(seconds=60)
     #: Max ordering groups published concurrently. Messages within a group are sequential.
     concurrency: int = 10
     #: A message that fails on its ``max_attempts``-th claim is dead-lettered.
     max_attempts: int = 10
     backoff: Backoff = field(default_factory=Backoff)
     #: Per-message publish timeout in seconds, so a hanging broker cannot outlive the
-    #: lease. ``None`` disables it.
-    publish_timeout: float | None = 10.0
+    #: lease. ``None`` disables it (and disables the worst-case round check).
+    publish_timeout: float | None = 5.0
     #: Idle polling: sleep grows from ``poll_min`` to ``poll_max`` while the table is empty.
     poll_min: float = 0.05
     poll_max: float = 5.0
@@ -57,6 +59,25 @@ class RelayConfig:
             raise ValueError("publish_timeout must be positive or None")
         if self.storage_error_delay < 0:
             raise ValueError("storage_error_delay must be >= 0")
+        worst = self.worst_case_round
+        if worst is not None and worst > self.lease.total_seconds():
+            log.warning(
+                "RelayConfig: worst-case round ceil(%d / %d) * %.1fs = %.0fs exceeds the %.0fs "
+                "lease; other workers may re-claim messages mid-round. Raise lease or "
+                "concurrency, or lower batch_size or publish_timeout.",
+                self.batch_size,
+                self.concurrency,
+                self.publish_timeout,
+                worst,
+                self.lease.total_seconds(),
+            )
+
+    @property
+    def worst_case_round(self) -> float | None:
+        """Seconds a round can take if every publish hits ``publish_timeout``."""
+        if self.publish_timeout is None:
+            return None
+        return math.ceil(self.batch_size / self.concurrency) * self.publish_timeout
 
 
 @dataclass(slots=True)
@@ -141,22 +162,30 @@ class Relay:
 
         With ``handle_signals=True``, the first SIGINT/SIGTERM calls :meth:`stop`, so the
         round in flight finishes and leases are released cleanly. A second signal cancels
-        the round outright. Previous handlers are restored on exit.
+        the round and ``run`` returns quietly.
+
+        ``handle_signals`` is for a process the relay owns (a dedicated worker). It replaces
+        the loop's signal handlers; plain ``signal.signal`` handlers are put back on exit,
+        but handlers another component registered with ``loop.add_signal_handler`` (uvicorn,
+        hypercorn) cannot be restored. Inside a web app use ``async with Relay(...)`` or call
+        :meth:`stop` from the framework's shutdown hook instead.
         """
         self._stopping = False
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         previous: dict[signal.Signals, object] = {}
         signals_seen = 0
+        cancelled_by_signal = False
 
         def on_signal() -> None:
-            nonlocal signals_seen
+            nonlocal signals_seen, cancelled_by_signal
             signals_seen += 1
             if signals_seen == 1:
                 log.info("signal received; finishing the current round")
                 self.stop()
-            elif task is not None:
+            elif task is not None and not cancelled_by_signal:
                 log.warning("second signal; cancelling the current round")
+                cancelled_by_signal = True
                 task.cancel()
 
         if handle_signals:
@@ -171,6 +200,10 @@ class Relay:
                 try:
                     result = await self.run_once()
                 except asyncio.CancelledError:
+                    if cancelled_by_signal and task is not None:
+                        task.uncancel()
+                        log.warning("round cancelled by signal; exiting")
+                        return
                     raise
                 except Exception:
                     delay = self.config.storage_error_delay
@@ -190,7 +223,7 @@ class Relay:
         finally:
             for sig, handler in previous.items():
                 loop.remove_signal_handler(sig)
-                if callable(handler) or handler in (signal.SIG_DFL, signal.SIG_IGN):
+                if _is_plain_handler(handler):
                     signal.signal(sig, handler)  # type: ignore[arg-type]
 
     async def __aenter__(self) -> Self:
@@ -297,7 +330,14 @@ class Relay:
             await self._hook(self.hooks.on_dead_letter, message, error)
             return now
         retry_at = now + self.config.backoff.delay(message.attempts)
-        log.debug("publish failed for %r (attempt %d): %s", message.id, message.attempts, text)
+        log.log(
+            logging.INFO if message.attempts == 1 else logging.DEBUG,
+            "publish failed for %r (attempt %d, retry at %s): %s",
+            message.id,
+            message.attempts,
+            retry_at.isoformat(timespec="seconds"),
+            text,
+        )
         await self._report(
             self.storage.nack(message.id, worker_id=self.worker_id, error=text, retry_at=retry_at)
         )
@@ -345,6 +385,13 @@ class Relay:
             raise
         except Exception:
             log.exception("hook %s raised", getattr(callback, "__name__", callback))
+
+
+def _is_plain_handler(handler: object) -> bool:
+    """A ``signal.signal`` handler we can put back. asyncio's internal C-level stub is not."""
+    if handler in (signal.SIG_DFL, signal.SIG_IGN):
+        return True
+    return callable(handler) and not getattr(handler, "__module__", "").startswith("asyncio")
 
 
 def _group_by_key(messages: Sequence[OutboxMessage]) -> list[list[OutboxMessage]]:

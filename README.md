@@ -27,7 +27,7 @@ are not allowed to change, you are back to writing your own relay.
 
 ## What txoutbox does
 
-Only the relay. You give it a storage (four methods over your table) and a publisher (one function),
+Only the relay. You give it a storage (five methods over your table) and a publisher (one function),
 and it handles the hard parts:
 
 | Concern | How |
@@ -38,8 +38,8 @@ and it handles the hard parts:
 | Retries | Exponential backoff with jitter, per message, scheduled in storage |
 | Poison messages | Dead-lettered after `max_attempts`, followers of a dead head carry on |
 | Idle polling | Adaptive: sleep grows from 50 ms to 5 s while the table is empty, resets on work; `wake()` for LISTEN/NOTIFY |
-| Broker hangs | Per-message `publish_timeout` (10 s by default) so a hang cannot outlive the lease |
-| Shutdown | First `SIGTERM`/`SIGINT` finishes the round in flight, second one cancels it. Published messages are acked even on cancel |
+| Broker hangs | Per-message `publish_timeout` (5 s by default). The defaults keep the worst-case round (25 s) under the lease (60 s), and `RelayConfig` warns when yours do not |
+| Shutdown | First `SIGTERM`/`SIGINT` finishes the round in flight, second one cancels it and returns quietly. Published messages are acked even on cancel |
 | Observability | `Hooks` for every outcome, `stats()` with queue depth and oldest-pending age for alerting |
 
 ## Install
@@ -76,8 +76,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Run the relay in as many processes as you like. Run it inside your web app with
-`async with Relay(outbox, publish): ...`, or one round at a time from a cron job with `await relay.run_once()`.
+Run the relay in as many processes as you like. `handle_signals=True` is for a process the relay owns:
+it takes over SIGINT/SIGTERM on the event loop, and handlers a web server registered there cannot be put
+back. Inside a web app use `async with Relay(outbox, publish): ...` or call `relay.stop()` from the
+framework's shutdown hook. From a cron job, run one round at a time with `await relay.run_once()`.
 
 ### Not polling: LISTEN/NOTIFY
 
@@ -87,12 +89,16 @@ relay = Relay(outbox, publish)
 listener = await outbox.listen(relay.wake)                # new row -> relay wakes up immediately
 ```
 
+The listener reconnects by itself if the connection drops; in the gap the relay falls back to polling,
+so nothing is lost. With `visibility_delay` set, the wake-up is deferred by that delay.
+
 ### Kafka in three lines
 
 ```python
 from aiokafka import AIOKafkaProducer
 
 producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
+await producer.start()
 
 async def publish(message: OutboxMessage) -> None:
     await producer.send_and_wait(
@@ -162,12 +168,12 @@ from datetime import timedelta
 from txoutbox import Backoff, RelayConfig
 
 RelayConfig(
-    batch_size=100,                     # rows per round
-    lease=timedelta(seconds=30),        # must exceed the time to publish one round
+    batch_size=50,                      # rows per round
+    lease=timedelta(seconds=60),        # must exceed ceil(batch_size / concurrency) * publish_timeout
     concurrency=10,                     # ordering groups published in parallel
     max_attempts=10,                    # then dead-letter
     backoff=Backoff(base=timedelta(seconds=1), factor=2, maximum=timedelta(minutes=5), jitter=0.25),
-    publish_timeout=10.0,               # seconds per publish, None = no limit
+    publish_timeout=5.0,                # seconds per publish, None = no limit
     poll_min=0.05, poll_max=5.0, poll_factor=2.0,
     storage_error_delay=1.0,            # sleep after a storage exception
 )
@@ -184,8 +190,15 @@ RelayConfig(
   a transaction with a smaller id can commit later and be picked up after a larger one. If that matters
   for your keys, set `PostgresStorage(visibility_delay=timedelta(seconds=2))` to only claim rows older than
   your longest producer transaction.
-* **Leases bound duplicates.** The relay logs a warning when a round outlives its lease. Keep `lease` well
-  above `batch_size / concurrency * publish_time` and leave `publish_timeout` on.
+* **Leases bound duplicates.** A round must finish inside its lease. `RelayConfig` warns at construction
+  when `ceil(batch_size / concurrency) * publish_timeout` exceeds `lease`, and the relay warns after the
+  fact when a round ran long. Leave `publish_timeout` on.
+* **Retry times use the application clock.** `retry_at` is computed by the relay and compared with the
+  database's `now()`. Clock skew between the two shifts retries by the same amount.
+* **Strict ordering on Postgres serialises claims** per table with an advisory lock. A claim takes
+  milliseconds, so throughput is bounded at roughly `batch_size * 1000 / claim_ms` messages per second no
+  matter how many workers you add; publishing still runs in parallel. Set `strict_ordering=False` if you do
+  not use keys.
 * **Bookkeeping failures are tolerated.** If `nack` itself fails, lease expiry recovers the row.
 
 ## What txoutbox is not

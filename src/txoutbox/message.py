@@ -14,7 +14,7 @@ MessageId: TypeAlias = Hashable
 
 #: What producers may pass as a payload. ``bytes`` go through untouched, ``str`` is
 #: UTF-8 encoded, anything else is JSON-encoded (compact, UTF-8, non-ASCII preserved).
-Payload: TypeAlias = "bytes | str | Mapping[str, Any] | list[Any]"
+Payload: TypeAlias = bytes | str | Mapping[str, Any] | list[Any]
 
 _EMPTY_HEADERS: Mapping[str, str] = MappingProxyType({})
 

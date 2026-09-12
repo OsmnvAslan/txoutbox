@@ -29,12 +29,7 @@ from .message import MessageId
 from .protocols import StatsProvider, Storage
 
 LEASE = timedelta(seconds=30)
-SHORT_LEASE = timedelta(milliseconds=50)
 FUTURE = timedelta(hours=1)
-
-
-async def _expire(lease: timedelta = SHORT_LEASE) -> None:
-    await asyncio.sleep(lease.total_seconds() * 2)
 
 
 class StorageContract:
@@ -42,6 +37,11 @@ class StorageContract:
 
     #: Set to ``False`` if your adapter does not implement strict per-key ordering.
     strict_ordering: bool = True
+    #: Lease used by the expiry tests. Raise it for a slow or remote database.
+    short_lease: timedelta = timedelta(milliseconds=50)
+
+    async def _expire(self) -> None:
+        await asyncio.sleep(self.short_lease.total_seconds() * 2)
 
     async def insert(
         self, storage: Any, topic: str, payload: bytes, key: str | None = None
@@ -81,8 +81,8 @@ class StorageContract:
         self, storage: Storage
     ) -> None:
         await self.insert(storage, "t", b"p")
-        await storage.claim(batch_size=10, lease=SHORT_LEASE, worker_id="w1")
-        await _expire()
+        await storage.claim(batch_size=10, lease=self.short_lease, worker_id="w1")
+        await self._expire()
         got = await storage.claim(batch_size=10, lease=LEASE, worker_id="w2")
         assert len(got) == 1 and got[0].attempts == 2
 
@@ -99,9 +99,9 @@ class StorageContract:
 
     async def test_acked_rows_are_never_claimed_again(self, storage: Storage) -> None:
         await self.insert(storage, "t", b"p")
-        got = await storage.claim(batch_size=10, lease=SHORT_LEASE, worker_id="w1")
+        got = await storage.claim(batch_size=10, lease=self.short_lease, worker_id="w1")
         await storage.ack([m.id for m in got], worker_id="w1")
-        await _expire()
+        await self._expire()
         assert list(await storage.claim(batch_size=10, lease=LEASE, worker_id="w1")) == []
 
     async def test_ack_and_release_empty_are_noops(self, storage: Storage) -> None:
@@ -140,9 +140,9 @@ class StorageContract:
 
     async def test_dead_letter_is_never_claimed_again(self, storage: Storage) -> None:
         await self.insert(storage, "t", b"p")
-        (m,) = await storage.claim(batch_size=10, lease=SHORT_LEASE, worker_id="w1")
+        (m,) = await storage.claim(batch_size=10, lease=self.short_lease, worker_id="w1")
         await storage.dead_letter(m.id, worker_id="w1", error="gave up")
-        await _expire()
+        await self._expire()
         assert list(await storage.claim(batch_size=10, lease=LEASE, worker_id="w1")) == []
 
     # -- fencing -----------------------------------------------------------------------
@@ -151,8 +151,8 @@ class StorageContract:
         self, storage: Storage
     ) -> None:
         a = await self.insert(storage, "t", b"a")
-        await storage.claim(batch_size=10, lease=SHORT_LEASE, worker_id="w1")
-        await _expire()
+        await storage.claim(batch_size=10, lease=self.short_lease, worker_id="w1")
+        await self._expire()
         (m,) = await storage.claim(batch_size=10, lease=LEASE, worker_id="w2")
         await storage.ack([a], worker_id="w1")  # w1 is late; must be ignored
         assert list(await storage.claim(batch_size=10, lease=LEASE, worker_id="w3")) == []
@@ -162,8 +162,8 @@ class StorageContract:
 
     async def test_stale_nack_does_not_break_another_workers_lease(self, storage: Storage) -> None:
         a = await self.insert(storage, "t", b"a")
-        await storage.claim(batch_size=10, lease=SHORT_LEASE, worker_id="w1")
-        await _expire()
+        await storage.claim(batch_size=10, lease=self.short_lease, worker_id="w1")
+        await self._expire()
         await storage.claim(batch_size=10, lease=LEASE, worker_id="w2")
         await storage.nack(a, worker_id="w1", error="late", retry_at=_now() - FUTURE)
         await storage.release([a], worker_id="w1", retry_at=_now() - FUTURE)
@@ -171,8 +171,8 @@ class StorageContract:
 
     async def test_stale_dead_letter_is_ignored(self, storage: Storage) -> None:
         a = await self.insert(storage, "t", b"a")
-        await storage.claim(batch_size=10, lease=SHORT_LEASE, worker_id="w1")
-        await _expire()
+        await storage.claim(batch_size=10, lease=self.short_lease, worker_id="w1")
+        await self._expire()
         await storage.claim(batch_size=10, lease=LEASE, worker_id="w2")
         await storage.dead_letter(a, worker_id="w1", error="late")
         await storage.nack(a, worker_id="w2", error="x", retry_at=_now() - FUTURE)

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-12
+
+### Fixed
+
+- Default `RelayConfig` could not keep its own promise: the worst-case round
+  (`ceil(batch_size / concurrency) * publish_timeout`) was 100 s against a 30 s lease.
+  Defaults are now `batch_size=50`, `lease=60s`, `publish_timeout=5s` (worst case 25 s),
+  and `RelayConfig` logs a warning with the arithmetic when a custom config breaks the
+  invariant. `RelayConfig.worst_case_round` exposes the estimate.
+- `run(handle_signals=True)` claimed to restore previous signal handlers, but handlers
+  registered with `loop.add_signal_handler` (uvicorn, hypercorn) cannot be restored and
+  were silently lost. Only plain `signal.signal` handlers are put back now, and the
+  docs say `handle_signals` is for a process the relay owns.
+- A second SIGINT/SIGTERM now makes `run()` return quietly instead of leaking
+  `CancelledError` out of `asyncio.run`.
+- `PostgresStorage.listen()` with `visibility_delay` woke the relay before the row was
+  visible; the wake-up is now deferred by the delay.
+- `PostgresStorage.listen()` reconnects when the connection drops instead of dying
+  silently. The relay polls in the meantime.
+- `PostgresStorage.stats()` uses two index-friendly queries instead of a table scan.
+- The first failed publish of a message is logged at INFO with the error text; later
+  attempts stay at DEBUG. The per-round summary remains at WARNING.
+- Kafka snippet in the README now starts the producer.
+
+### Changed
+
+- `StorageContract.short_lease` lets adapter authors raise the expiry-test lease for a
+  slow or remote database.
+- `pytest-timeout` is applied on the CI command line rather than in `pyproject.toml`,
+  so running the sdist's tests without the plugin does not warn.
+- Docs: advisory-lock throughput ceiling, clock skew note, `purge()` uses `created_at`.
+
 ## [0.2.0] - 2026-09-12
 
 Breaking release of the `Storage` protocol. Nothing depended on 0.1.0 yet, so the
@@ -77,6 +109,7 @@ guarantees were fixed instead of patched.
   `Storage` implementation against the relay's expectations, including lease
   expiry, concurrent claims and strict per-key ordering.
 
-[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OsmnvAslan/txoutbox/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/OsmnvAslan/txoutbox/releases/tag/v0.1.0
