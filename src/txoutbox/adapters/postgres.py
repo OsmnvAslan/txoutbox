@@ -254,6 +254,10 @@ class PostgresStorage:
             listener = await storage.listen(relay.wake)
             ...
             await listener.close()
+
+        The listener holds one connection from the pool for as long as it is open.
+        Size the pool accordingly: with ``max_size=1`` the relay's ``claim`` would wait
+        for a connection forever.
         """
         if not self.notify_channel:
             raise ValueError("listen() needs notify_channel")

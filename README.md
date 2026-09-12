@@ -97,13 +97,16 @@ so nothing is lost. With `visibility_delay` set, the wake-up is deferred by that
 ```python
 from aiokafka import AIOKafkaProducer
 
-producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
-await producer.start()
+async def main() -> None:
+    producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
+    await producer.start()
 
-async def publish(message: OutboxMessage) -> None:
-    await producer.send_and_wait(
-        message.topic, message.payload, key=message.key.encode() if message.key else None
-    )
+    async def publish(message: OutboxMessage) -> None:
+        await producer.send_and_wait(
+            message.topic, message.payload, key=message.key.encode() if message.key else None
+        )
+
+    await Relay(outbox, publish).run(handle_signals=True)
 ```
 
 ## Your own storage

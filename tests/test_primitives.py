@@ -69,3 +69,10 @@ def test_poller_validation() -> None:
         AdaptivePoller(minimum=0)
     with pytest.raises(ValueError):
         AdaptivePoller(minimum=2, maximum=1)
+
+
+async def test_poller_wait_with_explicit_timeout() -> None:
+    p = AdaptivePoller(minimum=5, maximum=5)
+    start = time.monotonic()
+    await p.wait(0.02)
+    assert 0.015 <= time.monotonic() - start < 1

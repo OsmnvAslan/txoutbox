@@ -435,3 +435,35 @@ async def test_first_failure_is_logged_at_info(caplog: pytest.LogCaptureFixture)
         logging.getLogger("txoutbox").setLevel(logging.CRITICAL)
     levels = [r.levelno for r in caplog.records if "broker down" in r.message]
     assert levels == [logging.INFO, logging.DEBUG]
+
+
+class _DownStorage(MemoryStorage):
+    async def claim(self, **kw):
+        raise ConnectionError("db down")
+
+
+async def test_stop_cuts_the_storage_error_pause_short() -> None:
+    relay = Relay(_DownStorage(), MemoryPublisher(), config=cfg(storage_error_delay=30))
+    task = asyncio.create_task(relay.run())
+    await asyncio.sleep(0.05)  # now sleeping in the error branch
+    relay.stop()
+    await asyncio.wait_for(task, 1)
+
+
+async def test_two_signals_during_storage_error_pause_return_quietly() -> None:
+    relay = Relay(_DownStorage(), MemoryPublisher(), config=cfg(storage_error_delay=30))
+    task = asyncio.create_task(relay.run(handle_signals=True))
+    await asyncio.sleep(0.05)
+    signal.raise_signal(signal.SIGTERM)
+    signal.raise_signal(signal.SIGTERM)
+    await asyncio.wait_for(task, 1)  # no CancelledError leaks out
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+async def test_external_cancellation_still_propagates_from_the_pause() -> None:
+    relay = Relay(_DownStorage(), MemoryPublisher(), config=cfg(storage_error_delay=30))
+    task = asyncio.create_task(relay.run())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

@@ -1,6 +1,6 @@
 [project]
 name = "txoutbox"
-version = "0.2.1"
+version = "0.2.2"
 description = "Storage-agnostic Transactional Outbox relay for asyncio: bring your own table, bring your own broker."
 readme = "README.md"
 license = "MIT"

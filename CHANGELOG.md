@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-12
+
+### Fixed
+
+- A second SIGINT/SIGTERM that arrived while `run()` was pausing after a storage
+  error leaked `CancelledError` instead of returning quietly; the cancellation guard
+  now covers the whole loop body.
+- The pause after a storage error is now cut short by `stop()` and by the first
+  signal, so a worker whose database is down still shuts down promptly.
+- `AdaptivePoller.wait()` accepts an explicit `timeout`.
+
+### Changed
+
+- Docs: `listen()` holds one pool connection; Kafka snippet is valid code.
+- GitHub Actions bumped to current majors.
+
 ## [0.2.1] - 2026-09-12
 
 ### Fixed
@@ -109,7 +125,8 @@ guarantees were fixed instead of patched.
   `Storage` implementation against the relay's expectations, including lease
   expiry, concurrent claims and strict per-key ordering.
 
-[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OsmnvAslan/txoutbox/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/OsmnvAslan/txoutbox/releases/tag/v0.1.0

@@ -41,14 +41,17 @@ class AdaptivePoller:
     def wake(self) -> None:
         self._wakeup.set()
 
-    async def wait(self) -> None:
-        """Sleep for the current interval, or less if :meth:`wake` is called.
+    async def wait(self, seconds: float | None = None) -> None:
+        """Sleep for ``seconds`` (default: the current interval), or less if
+        :meth:`wake` is called.
 
         A :meth:`wake` that happened before ``wait`` was entered is not lost: the
         next ``wait`` returns immediately.
         """
         try:
-            await asyncio.wait_for(self._wakeup.wait(), timeout=self._current)
+            await asyncio.wait_for(
+                self._wakeup.wait(), timeout=self._current if seconds is None else seconds
+            )
         except TimeoutError:
             pass
         finally:

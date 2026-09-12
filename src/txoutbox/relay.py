@@ -198,33 +198,40 @@ class Relay:
         try:
             while not self._stopping:
                 try:
-                    result = await self.run_once()
+                    await self._loop_step()
                 except asyncio.CancelledError:
                     if cancelled_by_signal and task is not None:
                         task.uncancel()
-                        log.warning("round cancelled by signal; exiting")
+                        log.warning("cancelled by signal; exiting")
                         return
                     raise
-                except Exception:
-                    delay = self.config.storage_error_delay
-                    log.exception("round failed; retrying in %.1fs", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                if self._stopping:
-                    break
-                if result.claimed:
-                    self._poller.busy()
-                    if result.claimed >= self.config.batch_size:
-                        await asyncio.sleep(0)  # full batch: there is probably more
-                        continue
-                else:
-                    self._poller.idle()
-                await self._poller.wait()
         finally:
             for sig, handler in previous.items():
                 loop.remove_signal_handler(sig)
                 if _is_plain_handler(handler):
                     signal.signal(sig, handler)  # type: ignore[arg-type]
+
+    async def _loop_step(self) -> None:
+        """One round plus the pause that follows it. Every pause is cut short by :meth:`stop`."""
+        try:
+            result = await self.run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            delay = self.config.storage_error_delay
+            log.exception("round failed; retrying in %.1fs", delay)
+            await self._poller.wait(delay)
+            return
+        if self._stopping:
+            return
+        if result.claimed:
+            self._poller.busy()
+            if result.claimed >= self.config.batch_size:
+                await asyncio.sleep(0)  # full batch: there is probably more
+                return
+        else:
+            self._poller.idle()
+        await self._poller.wait()
 
     async def __aenter__(self) -> Self:
         self._task = asyncio.create_task(self.run(), name=f"txoutbox-relay-{self.worker_id}")
