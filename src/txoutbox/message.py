@@ -27,7 +27,7 @@ class OutboxMessage:
     payload: bytes
     #: Ordering key. Messages sharing a key are published sequentially, in claim order.
     key: str | None = None
-    headers: Mapping[str, str] = field(default=_EMPTY_HEADERS)
+    headers: Mapping[str, str] = field(default_factory=lambda: _EMPTY_HEADERS)
     #: How many times this message has been claimed, including the current claim.
     attempts: int = 1
     created_at: datetime | None = None
