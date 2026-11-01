@@ -42,6 +42,7 @@ dev = [
   "asyncpg>=0.31.0",
   "pgserver>=0.1.4; python_version < '3.13'",
   "pytest-timeout>=2.3",
+  "pytest-cov>=7.1.0",
 ]
 examples = [
   "django>=5.0",
@@ -57,12 +58,21 @@ build-backend = "hatchling.build"
 packages = ["src/txoutbox"]
 
 [tool.hatch.build.targets.sdist]
-exclude = [".github", ".python-version", "uv.lock"]
+exclude = [".github", ".python-version", "uv.lock", "CLAUDE.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["txoutbox"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
 
 [tool.ruff]
 line-length = 100

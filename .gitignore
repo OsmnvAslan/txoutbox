@@ -19,3 +19,5 @@ wheels/
 *.db-wal
 *.db-shm
 pgdata/
+.coverage
+coverage.xml

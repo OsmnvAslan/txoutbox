@@ -4,18 +4,64 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONDEVMODE: "1"
+  FORCE_COLOR: "1"
 
 jobs:
-  test:
-    name: test (py${{ matrix.python-version }})
+  lint:
+    name: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked --group dev --group examples --extra postgres
+      - name: Ruff check
+        run: uv run ruff check --output-format=github src tests examples
+      - name: Ruff format
+        run: uv run ruff format --check src tests examples
+      - name: Mypy
+        run: uv run mypy src
+      - name: Lint workflows
+        run: uvx --from actionlint-py actionlint
+      - name: Audit workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uvx zizmor@1 --format=github .github/workflows
+
+  test:
+    name: test (py${{ matrix.python-version }}, pg${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        postgres: ["17"]
+        include:
+          - python-version: "3.11"
+            postgres: "14"
+          - python-version: "3.14"
+            postgres: "18"
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: txoutbox
           POSTGRES_PASSWORD: txoutbox
@@ -30,30 +76,125 @@ jobs:
     env:
       TXOUTBOX_PG_DSN: postgresql://txoutbox:txoutbox@localhost:5432/txoutbox
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Install
-        run: uv sync --group dev --group examples --extra postgres
+        run: uv sync --locked --group dev --group examples --extra postgres
       - name: Test
-        run: uv run pytest -q --timeout=120
+        run: >-
+          uv run pytest -q --timeout=120 -p no:cacheprovider -W error::RuntimeWarning
+          --cov --cov-report=term --cov-fail-under=93
+      - name: Coverage summary
+        if: always()
+        run: uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
 
-  lint:
-    name: lint
+  lowest:
+    name: test (lowest direct deps)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: txoutbox
+          POSTGRES_PASSWORD: txoutbox
+          POSTGRES_DB: txoutbox
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U txoutbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TXOUTBOX_PG_DSN: postgresql://txoutbox:txoutbox@localhost:5432/txoutbox
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+      - name: Install with the oldest allowed versions
+        run: |
+          uv sync --resolution lowest-direct --group dev --extra postgres
+          # The dev group pins a newer asyncpg; test the floor the extra promises.
+          uv pip install "asyncpg==$(sed -n 's/.*"asyncpg>=\([0-9.]*\)".*/\1/p' pyproject.toml | head -1)"
+          uv pip list
+      - name: Test
+        run: uv run --no-sync pytest -q --timeout=120 -p no:cacheprovider
+
+  platforms:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
           enable-cache: true
       - name: Install
-        run: uv sync --group dev --group examples --extra postgres
-      - name: Ruff check
-        run: uv run ruff check src tests examples
-      - name: Ruff format
-        run: uv run ruff format --check src tests examples
-      - name: Mypy
-        run: uv run mypy src
+        run: uv sync --locked --group dev --extra postgres
+      # No Postgres service on these runners: the Postgres suite skips, the rest runs.
+      - name: Test
+        run: uv run pytest -q --timeout=120 -p no:cacheprovider
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: uv build
+      - name: Check metadata
+        run: uvx twine check --strict dist/*
+      - name: Check sdist contents
+        run: |
+          tar -tzf dist/*.tar.gz | sed 's|^[^/]*/||' | sort > sdist.txt
+          for f in src/txoutbox/py.typed tests/test_relay.py LICENSE CHANGELOG.md; do
+            grep -qx "$f" sdist.txt || { echo "::error::sdist is missing $f"; exit 1; }
+          done
+          if grep -E '^(\.github/|CLAUDE\.md|uv\.lock)' sdist.txt; then
+            echo "::error::sdist contains repository-only files"; exit 1
+          fi
+      - name: Test the installed wheel
+        run: |
+          wheel=$(ls dist/*.whl)
+          uv run --isolated --no-project --python 3.12 \
+            --with "${wheel}[postgres]" --with pytest --with pytest-asyncio --with pytest-timeout \
+            python -c "import txoutbox, sys; assert 'site-packages' in txoutbox.__file__, txoutbox.__file__; print(txoutbox.__version__)"
+          uv run --isolated --no-project --python 3.12 \
+            --with "${wheel}[postgres]" --with pytest --with pytest-asyncio --with pytest-timeout \
+            pytest -q --timeout=120 -p no:cacheprovider tests
+
+  ok:
+    name: ci ok
+    if: always()
+    needs: [lint, test, lowest, platforms, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All required jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done

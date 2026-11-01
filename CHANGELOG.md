@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lower id could be younger than a higher one, and the ordering predicate did not hold
   a row back behind an earlier row that was still too young. Both are fixed: the
   predicate checks the age of earlier rows, and the schema uses `clock_timestamp()`.
+- `run(handle_signals=True)` raised `NotImplementedError` on exit on Windows, where the
+  event loop cannot install signal handlers: it tried to remove handlers it never added.
+
+### Changed
+
+- CI: Postgres 14/17/18, macOS and Windows, lowest direct dependency versions, branch
+  coverage gate, tests against the built wheel, workflow linting (actionlint, zizmor),
+  actions pinned by SHA with Dependabot. Releases now require green CI, a tag on `main`
+  and a changelog entry.
 
 ### Upgrading
 
