@@ -198,6 +198,26 @@ async def test_context_manager_and_wake() -> None:
     assert len(publisher.published) == 1
 
 
+async def test_context_manager_exits_when_the_body_returns_at_once() -> None:
+    # stop() from __aexit__ lands before the background run() has started.
+    async with Relay(MemoryStorage(), MemoryPublisher(), config=cfg()):
+        pass
+
+
+async def test_stop_before_run_returns_and_the_relay_can_run_again() -> None:
+    storage, publisher = MemoryStorage(), MemoryPublisher()
+    await storage.add("t", b"x")
+    relay = Relay(storage, publisher, config=cfg())
+    relay.stop()
+    await asyncio.wait_for(relay.run(), 1)
+    assert publisher.published == []
+    task = asyncio.create_task(relay.run())
+    while not publisher.published:
+        await asyncio.sleep(0.005)
+    relay.stop()
+    await asyncio.wait_for(task, 1)
+
+
 async def test_storage_errors_do_not_kill_the_loop() -> None:
     calls = 0
 

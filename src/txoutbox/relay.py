@@ -169,8 +169,10 @@ class Relay:
         but handlers another component registered with ``loop.add_signal_handler`` (uvicorn,
         hypercorn) cannot be restored. Inside a web app use ``async with Relay(...)`` or call
         :meth:`stop` from the framework's shutdown hook instead.
+
+        A :meth:`stop` that arrives before ``run`` starts is honoured: ``run`` returns
+        without claiming anything. The relay can be run again afterwards.
         """
-        self._stopping = False
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         previous: dict[signal.Signals, object] = {}
@@ -206,6 +208,7 @@ class Relay:
                         return
                     raise
         finally:
+            self._stopping = False
             for sig, handler in previous.items():
                 loop.remove_signal_handler(sig)
                 if _is_plain_handler(handler):

@@ -239,6 +239,34 @@ async def test_visibility_delay(pool) -> None:
     await _drop(pool, storage)
 
 
+async def test_visibility_delay_holds_back_successors_of_a_young_row(pool) -> None:
+    # A lower id can be younger than a higher one (rows from a table created before
+    # 0.2.3 used now(), the transaction start). The older row must still wait.
+    storage = await _make(pool, visibility_delay=timedelta(milliseconds=300))
+    t = storage.qualified_table
+    await pool.execute(f"INSERT INTO {t} (topic, key, payload) VALUES ('t', 'k', 'young')")
+    await pool.execute(
+        f"INSERT INTO {t} (topic, key, payload, created_at)"
+        " VALUES ('t', 'k', 'old', now() - interval '1 second')"
+    )
+    assert list(await storage.claim(batch_size=10, lease=LEASE, worker_id="w")) == []
+    await asyncio.sleep(0.4)
+    got = await storage.claim(batch_size=10, lease=LEASE, worker_id="w")
+    assert [m.payload for m in got] == [b"young", b"old"]
+    await _drop(pool, storage)
+
+
+async def test_created_at_is_the_insert_time_not_the_transaction_start(pool) -> None:
+    storage = await _make(pool)
+    async with pool.acquire() as conn, conn.transaction():
+        await storage.insert(conn, "t", b"first")
+        await asyncio.sleep(0.05)
+        await storage.insert(conn, "t", b"second")
+    got = await storage.claim(batch_size=10, lease=LEASE, worker_id="w")
+    assert got[1].created_at > got[0].created_at  # type: ignore[operator]
+    await _drop(pool, storage)
+
+
 def test_visibility_delay_validation() -> None:
     with pytest.raises(ValueError):
         PostgresStorage(object(), visibility_delay=timedelta(seconds=-1))  # type: ignore[arg-type]

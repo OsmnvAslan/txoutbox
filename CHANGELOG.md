@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-01
+
+### Fixed
+
+- `async with Relay(...)` hung forever when the body returned before the background
+  `run()` had started: `run()` reset the stop flag that `__aexit__` had just set. A
+  `stop()` that arrives before `run()` is now honoured, and the flag is reset on exit
+  so the relay can be run again.
+- `PostgresStorage` with `visibility_delay` and strict ordering could publish messages
+  of one key out of order: `created_at` defaulted to `now()` (transaction start), so a
+  lower id could be younger than a higher one, and the ordering predicate did not hold
+  a row back behind an earlier row that was still too young. Both are fixed: the
+  predicate checks the age of earlier rows, and the schema uses `clock_timestamp()`.
+
+### Upgrading
+
+- Existing Postgres tables keep `DEFAULT now()`; the predicate fix alone restores
+  ordering, but to make `visibility_delay` measure from insert time run
+  `ALTER TABLE outbox ALTER COLUMN created_at SET DEFAULT clock_timestamp();`.
+
 ## [0.2.2] - 2026-09-12
 
 ### Fixed
@@ -125,7 +145,8 @@ guarantees were fixed instead of patched.
   `Storage` implementation against the relay's expectations, including lease
   expiry, concurrent claims and strict per-key ordering.
 
-[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OsmnvAslan/txoutbox/compare/v0.1.0...v0.2.0
