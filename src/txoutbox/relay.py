@@ -192,11 +192,13 @@ class Relay:
 
         if handle_signals:
             for sig in (signal.SIGINT, signal.SIGTERM):
+                current = signal.getsignal(sig)
                 try:
-                    previous[sig] = signal.getsignal(sig)
                     loop.add_signal_handler(sig, on_signal)
-                except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows
+                except (NotImplementedError, RuntimeError):  # Windows
                     log.warning("cannot install handler for %s", sig.name)
+                    continue
+                previous[sig] = current
         try:
             while not self._stopping:
                 try:

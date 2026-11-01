@@ -1,5 +1,6 @@
 import asyncio
 import signal
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -7,6 +8,8 @@ import pytest
 
 from txoutbox import Backoff, Hooks, OutboxMessage, Relay, RelayConfig
 from txoutbox.adapters.memory import MemoryPublisher, MemoryStorage, Status
+
+posix_signals = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 
 
 def cfg(**kw) -> RelayConfig:
@@ -265,6 +268,7 @@ async def test_hook_exceptions_are_swallowed() -> None:
     assert result.published == 1
 
 
+@posix_signals
 async def test_signal_handler_stops_run() -> None:
     storage, publisher = MemoryStorage(), MemoryPublisher()
     relay = Relay(storage, publisher, config=cfg())
@@ -372,6 +376,7 @@ async def test_on_round_hook_and_failure_summary(caplog: pytest.LogCaptureFixtur
     logging.getLogger("txoutbox").setLevel(logging.CRITICAL)
 
 
+@posix_signals
 async def test_second_signal_cancels_the_round_and_returns_quietly() -> None:
     storage = MemoryStorage()
     await storage.add("t", b"x")
@@ -386,6 +391,7 @@ async def test_second_signal_cancels_the_round_and_returns_quietly() -> None:
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
+@posix_signals
 async def test_plain_signal_handler_is_restored() -> None:
     hits: list[int] = []
     previous = signal.signal(signal.SIGTERM, lambda signum, frame: hits.append(signum))
@@ -402,6 +408,7 @@ async def test_plain_signal_handler_is_restored() -> None:
         signal.signal(signal.SIGTERM, previous)
 
 
+@posix_signals
 async def test_loop_signal_handler_is_not_clobbered_into_a_noop() -> None:
     """We cannot restore a loop-level handler, but we must not leave asyncio's C stub behind."""
     loop = asyncio.get_running_loop()
@@ -470,6 +477,7 @@ async def test_stop_cuts_the_storage_error_pause_short() -> None:
     await asyncio.wait_for(task, 1)
 
 
+@posix_signals
 async def test_two_signals_during_storage_error_pause_return_quietly() -> None:
     relay = Relay(_DownStorage(), MemoryPublisher(), config=cfg(storage_error_delay=30))
     task = asyncio.create_task(relay.run(handle_signals=True))
@@ -487,3 +495,19 @@ async def test_external_cancellation_still_propagates_from_the_pause() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_handle_signals_without_loop_support_runs_and_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Windows' ProactorEventLoop raises NotImplementedError for both calls.
+    loop = asyncio.get_running_loop()
+
+    def unsupported(*args: object) -> None:
+        raise NotImplementedError
+
+    monkeypatch.setattr(loop, "add_signal_handler", unsupported)
+    monkeypatch.setattr(loop, "remove_signal_handler", unsupported)
+    relay = Relay(MemoryStorage(), MemoryPublisher(), config=cfg())
+    loop.call_later(0.05, relay.stop)
+    await asyncio.wait_for(relay.run(handle_signals=True), 1)
