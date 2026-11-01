@@ -18,7 +18,8 @@ permissions:
 jobs:
   ci:
     name: ci
-    uses: ./.github/workflows/ci.yml
+    # actionlint 1.7.12 does not understand the newer `$/` self-repository form yet.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
 
   build:
     name: build

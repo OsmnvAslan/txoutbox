@@ -39,11 +39,11 @@ jobs:
       - name: Mypy
         run: uv run mypy src
       - name: Lint workflows
-        run: uvx --from actionlint-py actionlint
+        run: uvx --from actionlint-py==1.7.12.25 actionlint
       - name: Audit workflows
         env:
           GH_TOKEN: ${{ github.token }}
-        run: uvx zizmor@1 --format=github .github/workflows
+        run: uvx zizmor@1.31.1 --format=github .github/workflows
 
   test:
     name: test (py${{ matrix.python-version }}, pg${{ matrix.postgres }})
