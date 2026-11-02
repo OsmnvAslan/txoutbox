@@ -86,12 +86,13 @@ jobs:
       - name: Install
         run: uv sync --locked --group dev --group examples --extra postgres
       - name: Test
+        id: test
         run: >-
           uv run pytest -q --timeout=120 -p no:cacheprovider -W error::RuntimeWarning
           --cov --cov-report=term --cov-fail-under=93
       - name: Coverage summary
-        if: always()
-        run: uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+        if: ${{ !cancelled() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure') }}
+        run: uv run --no-sync coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
 
   lowest:
     name: test (lowest direct deps)
@@ -123,8 +124,17 @@ jobs:
       - name: Install with the oldest allowed versions
         run: |
           uv sync --resolution lowest-direct --group dev --extra postgres
-          # The dev group pins a newer asyncpg; test the floor the extra promises.
-          uv pip install "asyncpg==$(sed -n 's/.*"asyncpg>=\([0-9.]*\)".*/\1/p' pyproject.toml | head -1)"
+          # The dev group pins a newer asyncpg; test the floor the postgres extra promises.
+          floor=$(uv run --no-sync python - <<'PY'
+          import re, tomllib
+          extra = tomllib.load(open("pyproject.toml", "rb"))["project"]["optional-dependencies"]
+          (spec,) = [d for d in extra["postgres"] if re.match(r"asyncpg\b", d)]
+          match = re.search(r">=\s*([0-9][0-9.]*)", spec)
+          assert match, f"no >= floor in {spec!r}"
+          print(match.group(1))
+          PY
+          )
+          uv pip install "asyncpg==$floor"
           uv pip list
       - name: Test
         run: uv run --no-sync pytest -q --timeout=120 -p no:cacheprovider
@@ -165,7 +175,7 @@ jobs:
       - name: Build
         run: uv build
       - name: Check metadata
-        run: uvx twine check --strict dist/*
+        run: uvx twine@7.0.0 check --strict dist/*
       - name: Check sdist contents
         run: |
           tar -tzf dist/*.tar.gz | sed 's|^[^/]*/||' | sort > sdist.txt

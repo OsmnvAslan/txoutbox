@@ -207,18 +207,29 @@ async def test_context_manager_exits_when_the_body_returns_at_once() -> None:
         pass
 
 
-async def test_stop_before_run_returns_and_the_relay_can_run_again() -> None:
+async def test_stop_after_a_cancelled_run_does_not_stick() -> None:
     storage, publisher = MemoryStorage(), MemoryPublisher()
-    await storage.add("t", b"x")
     relay = Relay(storage, publisher, config=cfg())
-    relay.stop()
-    await asyncio.wait_for(relay.run(), 1)
-    assert publisher.published == []
+    task = asyncio.create_task(relay.run())
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    relay.stop()  # a late shutdown hook
+    await storage.add("t", b"x")
     task = asyncio.create_task(relay.run())
     while not publisher.published:
         await asyncio.sleep(0.005)
     relay.stop()
     await asyncio.wait_for(task, 1)
+
+
+async def test_stop_ends_every_loop_sharing_a_relay() -> None:
+    relay = Relay(MemoryStorage(), MemoryPublisher(), config=cfg())
+    loops = [asyncio.create_task(relay.run()) for _ in range(2)]
+    await asyncio.sleep(0.02)
+    relay.stop()
+    await asyncio.wait_for(asyncio.gather(*loops), 1)
 
 
 async def test_storage_errors_do_not_kill_the_loop() -> None:

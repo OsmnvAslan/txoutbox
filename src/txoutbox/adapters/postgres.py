@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS {table} (
 );
 CREATE INDEX IF NOT EXISTS {name}_pending_idx ON {table} (id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS {name}_key_pending_idx ON {table} (key, id) WHERE status = 'pending';
+-- Tables created before 0.2.3 defaulted to now(), the transaction start (metadata-only change).
+ALTER TABLE {table} ALTER COLUMN created_at SET DEFAULT clock_timestamp();
 """
 
 NOTIFY_SQL = """

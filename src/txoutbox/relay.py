@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -10,7 +11,7 @@ import signal
 import socket
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -169,10 +170,8 @@ class Relay:
         but handlers another component registered with ``loop.add_signal_handler`` (uvicorn,
         hypercorn) cannot be restored. Inside a web app use ``async with Relay(...)`` or call
         :meth:`stop` from the framework's shutdown hook instead.
-
-        A :meth:`stop` that arrives before ``run`` starts is honoured: ``run`` returns
-        without claiming anything. The relay can be run again afterwards.
         """
+        self._stopping = False
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         previous: dict[signal.Signals, object] = {}
@@ -210,7 +209,6 @@ class Relay:
                         return
                     raise
         finally:
-            self._stopping = False
             for sig, handler in previous.items():
                 loop.remove_signal_handler(sig)
                 if _is_plain_handler(handler):
@@ -249,9 +247,16 @@ class Relay:
         tb: TracebackType | None,
     ) -> None:
         self.stop()
-        if self._task is not None:
-            await self._task
-            self._task = None
+        task, self._task = self._task, None
+        if task is None:
+            return
+        coro = task.get_coro()
+        if isinstance(coro, Coroutine) and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED:
+            # run() has not started, so it would reset the stop flag; there is no round to finish.
+            task.cancel()
+        await asyncio.wait([task])
+        if not task.cancelled():
+            task.result()
 
     # -- one round ---------------------------------------------------------------------
 
