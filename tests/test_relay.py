@@ -207,6 +207,25 @@ async def test_context_manager_exits_when_the_body_returns_at_once() -> None:
         pass
 
 
+async def test_cancelling_context_exit_cancels_the_relay_task() -> None:
+    storage = MemoryStorage()
+    await storage.add("t", b"x")
+    relay = Relay(storage, MemoryPublisher(delay=5), config=cfg())
+
+    async def app() -> None:
+        async with relay:
+            await asyncio.sleep(0.05)  # a round with a slow publish is in flight
+
+    outer = asyncio.create_task(app())
+    await asyncio.sleep(0.02)
+    (inner,) = [t for t in asyncio.all_tasks() if t.get_name().startswith("txoutbox-relay")]
+    await asyncio.sleep(0.08)  # outer is inside __aexit__, waiting for the round
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert inner.cancelled()
+
+
 async def test_stop_after_a_cancelled_run_does_not_stick() -> None:
     storage, publisher = MemoryStorage(), MemoryPublisher()
     relay = Relay(storage, publisher, config=cfg())

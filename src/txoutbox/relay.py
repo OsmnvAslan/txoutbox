@@ -254,9 +254,12 @@ class Relay:
         if isinstance(coro, Coroutine) and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED:
             # run() has not started, so it would reset the stop flag; there is no round to finish.
             task.cancel()
-        await asyncio.wait([task])
-        if not task.cancelled():
-            task.result()
+        try:
+            await task  # not asyncio.wait: cancelling __aexit__ must reach the relay task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
     # -- one round ---------------------------------------------------------------------
 
