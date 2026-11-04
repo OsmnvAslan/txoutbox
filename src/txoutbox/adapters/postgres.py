@@ -39,10 +39,12 @@ CREATE TABLE IF NOT EXISTS {table} (
     leased_by   TEXT,
     lease_until TIMESTAMPTZ,
     last_error  TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX IF NOT EXISTS {name}_pending_idx ON {table} (id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS {name}_key_pending_idx ON {table} (key, id) WHERE status = 'pending';
+-- Tables created before 0.2.3 defaulted to now(), the transaction start (metadata-only change).
+ALTER TABLE {table} ALTER COLUMN created_at SET DEFAULT clock_timestamp();
 """
 
 NOTIFY_SQL = """
@@ -77,6 +79,9 @@ class PostgresStorage:
       are assigned at insert time, not commit time, so a long transaction can commit a
       lower id *after* a higher one was already delivered. A delay of a few seconds
       (longer than your slowest producing transaction) makes that reordering impossible.
+      Age is measured from ``created_at``, which must be the insert time
+      (``clock_timestamp()``), not the transaction start (``now()``); with strict
+      ordering, a row is also held back while an earlier row with its key is too young.
     * ``notify_channel`` adds an ``AFTER INSERT`` trigger to :meth:`schema_sql` that
       calls ``pg_notify``; pair it with :meth:`listen` to wake the relay instantly.
     """
@@ -403,10 +408,12 @@ class _Sql:
     """Statements pre-rendered for one table."""
 
     def __init__(self, table: str, strict_ordering: bool, visibility_delay: bool) -> None:
+        young = " OR p.created_at > now() - $4::interval" if visibility_delay else ""
         blocked = (
             " AND (o.key IS NULL OR NOT EXISTS ("
             f"SELECT 1 FROM {table} p WHERE p.key = o.key AND p.id < o.id"
-            " AND p.status = 'pending' AND (p.retry_at > now() OR p.lease_until > now())))"
+            " AND p.status = 'pending'"
+            f" AND (p.retry_at > now() OR p.lease_until > now(){young})))"
             if strict_ordering
             else ""
         )

@@ -192,7 +192,8 @@ RelayConfig(
 * **Insertion order is id order, not commit order.** On Postgres a `BIGSERIAL` id is assigned at `INSERT`;
   a transaction with a smaller id can commit later and be picked up after a larger one. If that matters
   for your keys, set `PostgresStorage(visibility_delay=timedelta(seconds=2))` to only claim rows older than
-  your longest producer transaction.
+  your longest producer transaction. Age is measured from `created_at`, which the schema sets to the
+  insert time (`clock_timestamp()`); for tables created before 0.2.3, `create_schema()` switches the default.
 * **Leases bound duplicates.** A round must finish inside its lease. `RelayConfig` warns at construction
   when `ceil(batch_size / concurrency) * publish_timeout` exceeds `lease`, and the relay warns after the
   fact when a round ran long. Leave `publish_timeout` on.

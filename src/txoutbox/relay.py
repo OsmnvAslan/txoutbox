@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -10,7 +11,7 @@ import signal
 import socket
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -190,11 +191,13 @@ class Relay:
 
         if handle_signals:
             for sig in (signal.SIGINT, signal.SIGTERM):
+                current = signal.getsignal(sig)
                 try:
-                    previous[sig] = signal.getsignal(sig)
                     loop.add_signal_handler(sig, on_signal)
-                except (NotImplementedError, RuntimeError):  # pragma: no cover - Windows
+                except (NotImplementedError, RuntimeError):  # Windows
                     log.warning("cannot install handler for %s", sig.name)
+                    continue
+                previous[sig] = current
         try:
             while not self._stopping:
                 try:
@@ -244,9 +247,19 @@ class Relay:
         tb: TracebackType | None,
     ) -> None:
         self.stop()
-        if self._task is not None:
-            await self._task
-            self._task = None
+        task, self._task = self._task, None
+        if task is None:
+            return
+        coro = task.get_coro()
+        if isinstance(coro, Coroutine) and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED:
+            # run() has not started, so it would reset the stop flag; there is no round to finish.
+            task.cancel()
+        try:
+            await task  # not asyncio.wait: cancelling __aexit__ must reach the relay task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
     # -- one round ---------------------------------------------------------------------
 

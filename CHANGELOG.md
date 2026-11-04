@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-01
+
+### Fixed
+
+- `async with Relay(...)` hung forever when the body returned before the background
+  `run()` had started: `run()` reset the stop flag that `__aexit__` had just set.
+  `__aexit__` now cancels a relay task that has not started yet; `run()` semantics are
+  unchanged.
+- `PostgresStorage` with `visibility_delay` and strict ordering could publish messages
+  of one key out of order: `created_at` defaulted to `now()` (transaction start), so a
+  lower id could be younger than a higher one, and the ordering predicate did not hold
+  a row back behind an earlier row that was still too young. Both are fixed: the
+  predicate checks the age of earlier rows, and the schema uses `clock_timestamp()`.
+- `run(handle_signals=True)` raised `NotImplementedError` on exit on Windows, where the
+  event loop cannot install signal handlers: it tried to remove handlers it never added.
+
+### Changed
+
+- CI: Postgres 14/17/18, macOS and Windows, lowest direct dependency versions, branch
+  coverage gate, tests against the built wheel, workflow linting (actionlint, zizmor),
+  actions pinned by SHA with Dependabot. Releases now require green CI, a tag on `main`
+  and a changelog entry.
+
+### Upgrading
+
+- Tables created by earlier versions default `created_at` to `now()`. With that
+  default the predicate fix is not enough: a row whose transaction has not committed
+  is invisible to the check, so `visibility_delay` would have to exceed twice your
+  longest producer transaction. `schema_sql()` / `create_schema()` now end with
+  `ALTER TABLE ... ALTER COLUMN created_at SET DEFAULT clock_timestamp()` (a brief
+  metadata-only lock); run `create_schema()` once or add that statement to a migration.
+
 ## [0.2.2] - 2026-09-12
 
 ### Fixed
@@ -125,7 +157,8 @@ guarantees were fixed instead of patched.
   `Storage` implementation against the relay's expectations, including lease
   expiry, concurrent claims and strict per-key ordering.
 
-[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/OsmnvAslan/txoutbox/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/OsmnvAslan/txoutbox/compare/v0.1.0...v0.2.0
